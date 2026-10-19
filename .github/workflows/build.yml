@@ -1,0 +1,396 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Crear proyecto
+        run: |
+          mkdir -p ChatNotifier/app/src/main/java/com/chatnotifier
+          cd ChatNotifier
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "ChatNotifier"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.chatnotifier"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.chatnotifier"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+              <application
+                  android:label="Chat Notifier"
+                  android:theme="@android:style/Theme.DeviceDefault.Light"
+                  android:usesCleartextTraffic="false">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".ChatService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="Monitors a web chat and posts notifications for new messages" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/chatnotifier/MainActivity.kt <<'EOF'
+          package com.chatnotifier
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+
+              private lateinit var log: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad, pad, pad)
+                  }
+
+                  fun field(hint: String, key: String, def: String): EditText {
+                      val e = EditText(this)
+                      e.hint = hint
+                      e.setText(prefs.getString(key, def))
+                      e.setSingleLine(true)
+                      root.addView(e)
+                      return e
+                  }
+
+                  val url = field("URL del chat", "url", "https://www.chatbro.com/es/68zQh/")
+                  val kw = field("Palabras clave (coma). Vacío = todos", "kw", "")
+                  val sel = field("Selector CSS de mensajes (opcional)", "sel", "")
+
+                  fun save() {
+                      prefs.edit()
+                          .putString("url", url.text.toString().trim())
+                          .putString("kw", kw.text.toString().trim())
+                          .putString("sel", sel.text.toString().trim())
+                          .apply()
+                  }
+
+                  fun button(label: String, action: () -> Unit) {
+                      val b = Button(this)
+                      b.text = label
+                      b.setOnClickListener { action() }
+                      root.addView(b)
+                  }
+
+                  button("Iniciar") {
+                      save()
+                      if (Build.VERSION.SDK_INT >= 33) {
+                          requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                      }
+                      startForegroundService(Intent(this, ChatService::class.java))
+                  }
+                  button("Detener") {
+                      stopService(Intent(this, ChatService::class.java))
+                  }
+                  button("Quitar restricción de batería") {
+                      try {
+                          startActivity(
+                              Intent(
+                                  Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                  Uri.parse("package:$packageName")
+                              )
+                          )
+                      } catch (e: Exception) {
+                          startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                      }
+                  }
+                  button("Actualizar lista de detectados") { refreshLog() }
+
+                  log = TextView(this)
+                  root.addView(log)
+
+                  val scroll = ScrollView(this)
+                  scroll.addView(root)
+                  setContentView(scroll)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refreshLog()
+              }
+
+              private fun refreshLog() {
+                  val last = getSharedPreferences("cfg", MODE_PRIVATE).getString("last", "") ?: ""
+                  log.text = if (last.isBlank()) "Aún no se ha detectado ningún mensaje." else "Últimos detectados:\n\n" + last
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/chatnotifier/ChatService.kt <<'EOF'
+          package com.chatnotifier
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.PowerManager
+          import android.webkit.JavascriptInterface
+          import android.webkit.WebResourceError
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import org.json.JSONObject
+
+          class ChatService : Service() {
+
+              private var web: WebView? = null
+              private var wake: PowerManager.WakeLock? = null
+              private val main = Handler(Looper.getMainLooper())
+              private val seen = HashMap<String, Long>()
+              private var keywords: List<String> = emptyList()
+              private var nid = 0
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel("ongoing", "Servicio activo", NotificationManager.IMPORTANCE_MIN)
+                  )
+                  nm.createNotificationChannel(
+                      NotificationChannel("msgs", "Mensajes del chat", NotificationManager.IMPORTANCE_HIGH)
+                  )
+
+                  val fg = Notification.Builder(this, "ongoing")
+                      .setSmallIcon(android.R.drawable.ic_dialog_info)
+                      .setContentTitle("Chat Notifier activo")
+                      .setContentText("Vigilando el chat")
+                      .setOngoing(true)
+                      .build()
+                  startForeground(1, fg)
+
+                  val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                  keywords = (prefs.getString("kw", "") ?: "")
+                      .split(",").map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+
+                  if (web == null) {
+                      val pm = getSystemService(PowerManager::class.java)
+                      wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "chatnotifier:ws").also { it.acquire() }
+                      startWeb(
+                          prefs.getString("url", "https://www.chatbro.com/es/68zQh/") ?: "",
+                          prefs.getString("sel", "") ?: ""
+                      )
+                  }
+                  return START_STICKY
+              }
+
+              private fun startWeb(url: String, selector: String) {
+                  val script = JS.replace("__SEL__", JSONObject.quote(selector))
+                  val wv = WebView(applicationContext)
+                  wv.settings.javaScriptEnabled = true
+                  wv.settings.domStorageEnabled = true
+                  wv.settings.mediaPlaybackRequiresUserGesture = true
+                  wv.addJavascriptInterface(Bridge(), "Android")
+                  wv.webViewClient = object : WebViewClient() {
+                      override fun onPageFinished(view: WebView?, url: String?) {
+                          view?.evaluateJavascript(script, null)
+                      }
+
+                      override fun onReceivedError(
+                          view: WebView?, request: WebResourceRequest?, error: WebResourceError?
+                      ) {
+                          if (request?.isForMainFrame == true) {
+                              main.postDelayed({ view?.reload() }, 15000)
+                          }
+                      }
+                  }
+                  web = wv
+                  wv.onResume()
+                  wv.resumeTimers()
+                  wv.loadUrl(url)
+                  keepAlive()
+              }
+
+              // Evita que el WebView oculto se pause
+              private fun keepAlive() {
+                  main.postDelayed({
+                      web?.onResume()
+                      web?.resumeTimers()
+                      keepAlive()
+                  }, 60000)
+              }
+
+              inner class Bridge {
+                  @JavascriptInterface
+                  fun msg(text: String) {
+                      main.post { handle(text) }
+                  }
+              }
+
+              private fun handle(text: String) {
+                  val now = System.currentTimeMillis()
+                  val last = seen[text]
+                  if (last != null && now - last < 10000) return
+                  seen[text] = now
+
+                  val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                  val old = (prefs.getString("last", "") ?: "").split("\n").filter { it.isNotBlank() }
+                  prefs.edit().putString("last", (listOf("• $text") + old).take(8).joinToString("\n")).apply()
+
+                  if (keywords.isNotEmpty() && keywords.none { text.lowercase().contains(it) }) return
+
+                  val pi = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val n = Notification.Builder(this, "msgs")
+                      .setSmallIcon(android.R.drawable.ic_dialog_info)
+                      .setContentTitle("Chat TNT Sports")
+                      .setContentText(text)
+                      .setStyle(Notification.BigTextStyle().bigText(text))
+                      .setContentIntent(pi)
+                      .setAutoCancel(true)
+                      .build()
+                  nid = (nid + 1) % 30
+                  getSystemService(NotificationManager::class.java).notify(100 + nid, n)
+              }
+
+              override fun onDestroy() {
+                  main.removeCallbacksAndMessages(null)
+                  web?.destroy()
+                  web = null
+                  wake?.let { if (it.isHeld) it.release() }
+                  super.onDestroy()
+              }
+
+              companion object {
+                  private const val JS = """
+          (function(){
+            if (window.__cn) return; window.__cn = true;
+            var SEL = __SEL__;
+            var start = Date.now(), seen = {}, batch = [], timer = null;
+            function clean(s){ return (s||'').replace(/\s+/g,' ').trim(); }
+            function ext(n){
+              if (n.nodeType !== 1) return [];
+              if (/^(SCRIPT|STYLE|INPUT|TEXTAREA|BUTTON|SVG|IMG|IFRAME)${'$'}/i.test(n.tagName)) return [];
+              if (n.isContentEditable || (n.closest && n.closest('[contenteditable],textarea,input'))) return [];
+              var out = [];
+              if (SEL) {
+                try {
+                  if (n.matches(SEL)) out.push(n);
+                  n.querySelectorAll(SEL).forEach(function(x){ out.push(x); });
+                } catch(e) {}
+              } else { out.push(n); }
+              return out.map(function(x){ return clean(x.innerText || x.textContent); });
+            }
+            function flush(){
+              timer = null;
+              var items = batch.filter(function(t,i,a){ return a.indexOf(t) === i; });
+              batch = [];
+              items = items.filter(function(t){
+                return !items.some(function(o){ return o !== t && o.indexOf(t) !== -1; });
+              });
+              items.forEach(function(t){ Android.msg(t); });
+            }
+            new MutationObserver(function(ms){
+              if (Date.now() - start < 6000) return;
+              var now = Date.now();
+              ms.forEach(function(m){
+                m.addedNodes.forEach(function(n){
+                  ext(n).forEach(function(t){
+                    if (t.length < 2 || t.length > 400) return;
+                    if (seen[t] && now - seen[t] < 10000) return;
+                    seen[t] = now; batch.push(t);
+                  });
+                });
+              });
+              if (batch.length && !timer) timer = setTimeout(flush, 600);
+            }).observe(document.body, {childList:true, subtree:true});
+          })();
+          """
+              }
+          }
+          EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - run: gradle assembleDebug
+        working-directory: ChatNotifier
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ChatNotifier-apk
+          path: ChatNotifier/app/build/outputs/apk/debug/app-debug.apk
